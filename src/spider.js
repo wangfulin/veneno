@@ -1,120 +1,132 @@
 "use strict";
-var through = require('through2');
-var request = require('request');
+const request = require('request');
+const output = require('../lib/out');
 
-var hostPrefix = '';
-var urlStack = [];
-var jsCount = 0;
-var jsStack = [];
-var xhrCount = 0;
-var xhrStack = [];
+let crossSite = false;
+let hostPrefix = '';
+let urlStack = [];
+let jsStack = [];
+let xhrStack = [];
 
-function httpGet(url, errStr) {
-    //console.log('发起请求:', url);
-    return request
-        .get(url)
-        .on('error', function (err) {
-            //console.log('出错url:', url);
-            //console.log(err);
-            //console.log('出错时扫到的:', errStr);
-        })
-        .pipe(filter())
+function httpGet(url) {
+    request({url: url}, (error, response, body) => {
+        if (error == null) {
+            let htmlContent = body;
+            detectPath(htmlContent);
+            detectJs(htmlContent);
+        } else {
+            output.err(error);
+        }
+    })
 }
 
 function httpGetJs(src) {
-    request.get(src).pipe(detectXhr());
-}
-
-function filter() {
-    return through.obj({objectMode: true, allowHalfOpen: false}, function (file, enc, cb) {
-        let htmlContent = file.toString();
-        detectPath(htmlContent);
-        detectJs(htmlContent);
-        cb();
+    request({url: src}, (error, response, body) => {
+        if (error == null) {
+            detectXhr(body);
+        } else {
+            output.err(error);
+        }
     })
 }
 
 function detectPath(str) {
     let reg = /<a\b("[^"]*"|'[^']*'|[^'">])*>/g;
-    str.replace(reg, function (i) {
+    str.replace(reg, (i) => {
         let reg2 = /href=["'].*?["']/g;
-        i.replace(reg2, function (ii) {
+        i.replace(reg2, (ii) => {
             let url = ii.slice(6, ii.length - 1);
-            //console.log('发现路径:', url);
-            if (/^http/.test(url) || /^git/.test(url) || /^javascript/.test(url)) {
-                //console.log('忽略外站url:', url);
+            output.log('发现路径:' + url);
+            if (/^git/.test(url) || /^javascript/.test(url)) {
+                //todo: 忽略除http以外的其他协议
+                return;
+            }
+            if (/^http/.test(url) && crossSite) {
+                output.log('发现外站路径:' + url);
+                httpGet(url);
                 return;
             }
             for (let j = 0; j < urlStack.length; j++) {
                 if (urlStack[j] == url) {
-                    //console.log('忽略已扫url:', url);
+                    //todo: 忽略已扫url
                     return;
                 }
             }
             urlStack.push(url);
-            httpGet(hostPrefix + url, ii);
+            httpGet(hostPrefix + url);
         })
     });
 }
 
 function detectJs(str) {
     let reg = /<script\b("[^"]*"|'[^']*'|[^'">])*>/g;
-    str.replace(reg, function (i) {
+    str.replace(reg, (i) => {
         let reg2 = /src=["'].*?["']/g;
-        i.replace(reg2, function (ii) {
-            var src = ii.slice(5, ii.length - 1);
+        i.replace(reg2, (ii) => {
+            let src = ii.slice(5, ii.length - 1);
             for (let j = 0; j < jsStack.length; j++) {
-                if (/^http/.test(src)) {
-                    //console.log('发现外站js:', url);
-                    httpGetJs(src);
-                    return;
-                }
                 if (jsStack[j] == src) {
-                    //console.log('忽略已扫src:', url);
+                    //todo: 忽略已扫src
                     return;
                 }
             }
-            jsStack.push(src);
-            jsCount++;
-            console.log('发现js:', src);
-            httpGetJs(hostPrefix + src);
+            if (/^http/.test(src)) {
+                output.log('发现外站脚本:' + src);
+                httpGetJs(src);
+                jsStack.push(src);
+            } else {
+                output.log('发现站内脚本:' + src);
+                httpGetJs(hostPrefix + src);
+                jsStack.push(hostPrefix + src);
+            }
         })
     });
 }
 
-function detectXhr() {
-    return through.obj({objectMode: true, allowHalfOpen: false}, function (file, enc, cb) {
-        let jsContent = file.toString();
-        let reg = /["']\/\w*['"]/g;
-        jsContent.replace(reg, function (token) {
-            console.log('发现疑似ajax接口:', token);
-            for (let j = 0; j < jsStack.length; j++) {
-                if (xhrStack[j] == token) {
-                    console.log('忽略已扫xhr:', token);
-                    return;
-                }
+function detectXhr(body) {
+    let jsContent = body;
+    if (/define\.amd\.jQuery/.test(jsContent)) {
+        //todo: 发现jquery类库js
+        return;
+    }
+    let reg = /["']\/\w*['"]/g;
+    jsContent.replace(reg, (token) => {
+        let xhr = token.slice(1, token.length - 1);
+        if (xhr == '\/') {
+            //todo: 忽略无意义的"/"
+            return;
+        }
+        for (let j = 0; j < xhrStack.length; j++) {
+            if (xhr == xhrStack[j]) {
+                //todo: 忽略已扫xhr
+                return;
             }
-            xhrStack.push(token);
-            xhrCount++;
-        });
-        cb();
-    })
+        }
+        output.print('发现疑似ajax接口:' + xhr);
+        xhrStack.push(xhr);
+    });
 }
 
-process.on('exit', function (code) {
-    if(code == 0){
-        console.timeEnd('共消耗时间');
-        console.log('共发现xhr地址:' + xhrCount + '个');
-    }else {
-        console.log()
-    }
-});
-
-function main(host) {
+function main(param) {
     console.time('共消耗时间');
-    let url = 'http://' + host;
-    hostPrefix = url;
-    httpGet(url);
+    hostPrefix = 'http://' + param.host;
+    crossSite = param.crossSite;
+    if (param.log) {
+        process.env.LOG = param.log;
+    } else {
+        process.env.LOG = 'none'
+    }
+    process.on('exit', (code) => {
+        if (code == 0) {
+            console.timeEnd('共消耗时间');
+            output.print('共发现xhr地址:' + xhrStack.length + '个');
+        } else {
+            console.timeEnd('共消耗时间');
+            output.err('异常结束，code:' + code);
+        }
+    });
+
+    httpGet(hostPrefix);
 }
 
 module.exports = main
